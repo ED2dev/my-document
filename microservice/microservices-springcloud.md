@@ -315,3 +315,178 @@ Từ **9671ms** xuống còn **~350ms** — đây là ý nghĩa của fail fast.
 > - **Eureka** = đảm bảo các service **tìm thấy nhau**
 > - **Circuit Breaker** = đảm bảo hệ thống **fail fast** khi có sự cố
 > - Ba thứ này phối hợp với nhau, không thay thế nhau
+
+---
+
+## 6. API Gateway — Spring Cloud Gateway
+
+### 6.1 Vấn đề
+
+Không có Gateway, client phải biết địa chỉ từng service:
+
+```
+Client → http://localhost:8081/inventory  (Inventory Service)
+Client → http://localhost:8082/order      (Order Service)
+Client → http://localhost:8083/payment    (Payment Service)
+```
+
+Hậu quả:
+- Lộ internal architecture — client biết IP/port từng service
+- Auth, logging, rate limiting phải làm lại ở từng service
+- CORS, SSL phải config nhiều chỗ
+
+### 6.2 API Gateway giải quyết
+
+Một cửa ngõ duy nhất — client chỉ biết 1 địa chỉ:
+
+```
+Client → http://localhost:8080/inventory  →  Inventory Service
+Client → http://localhost:8080/order      →  Order Service
+Client → http://localhost:8080/payment    →  Payment Service
+```
+
+### 6.3 pom.xml
+
+```xml
+<properties>
+    <spring-cloud.version>2025.0.0</spring-cloud.version>
+</properties>
+
+<dependencies>
+    <!-- Gateway — KHÔNG thêm spring-boot-starter-web, sẽ conflict -->
+    <dependency>
+        <groupId>org.springframework.cloud</groupId>
+        <artifactId>spring-cloud-starter-gateway</artifactId>
+    </dependency>
+
+    <!-- Để Gateway hỏi Eureka lấy địa chỉ service -->
+    <dependency>
+        <groupId>org.springframework.cloud</groupId>
+        <artifactId>spring-cloud-starter-netflix-eureka-client</artifactId>
+    </dependency>
+</dependencies>
+
+<!-- Thêm dependencyManagement block giống các service khác -->
+```
+
+> **Tại sao không dùng spring-boot-starter-web?**  
+> Gateway chạy trên Spring WebFlux (reactive/non-blocking). Nếu thêm spring-boot-starter-web (servlet-based) sẽ conflict và không chạy được.
+
+### 6.4 application.yml
+
+```yaml
+server:
+  port: 8080
+
+spring:
+  application:
+    name: api-gateway
+
+  cloud:
+    gateway:
+      discovery:
+        locator:
+          enabled: true                # tự động tạo route theo tên service trong Eureka
+          lower-case-service-id: true  # dùng chữ thường: inventory-service thay vì INVENTORY-SERVICE
+
+      routes:
+        - id: inventory-route
+          uri: lb://inventory-service  # lb = load balanced, hỏi Eureka lấy địa chỉ
+          predicates:
+            - Path=/inventory/**       # request có path /inventory/... → route vào đây
+
+        - id: order-route
+          uri: lb://order-service
+          predicates:
+            - Path=/order/**
+
+eureka:
+  client:
+    service-url:
+      defaultZone: http://localhost:8761/eureka/
+```
+
+> **`lb://` là gì?**  
+> Báo Gateway dùng load balancer để resolve tên service qua Eureka, không gọi thẳng IP.  
+> Nếu có 2 instance inventory-service, Gateway tự phân phối request giữa 2 cái.
+
+### 6.5 Thứ tự khởi động
+
+```
+1. Eureka Server  (8761)  — phải chạy trước
+2. Inventory Service (8083, 8084)
+3. Order Service  (8082)
+4. API Gateway    (8080)  — chạy sau cùng
+```
+
+### 6.6 Global Filter — logging mọi request
+
+Mọi request đi qua Gateway đều bị bắt lại, không cần sửa từng service:
+
+```java
+@Component
+public class LoggingFilter implements GlobalFilter {
+
+    private static final Logger log = LoggerFactory.getLogger(LoggingFilter.class);
+
+    @Override
+    public Mono<Void> filter(ServerWebExchange exchange, GatewayFilterChain chain) {
+        String path = exchange.getRequest().getPath().toString();
+        String method = exchange.getRequest().getMethod().toString();
+
+        log.info("Request: {} {}", method, path);
+
+        return chain.filter(exchange).then(Mono.fromRunnable(() -> {
+            int status = exchange.getResponse().getStatusCode().value();
+            log.info("Response: {} {} → {}", method, path, status);
+        }));
+    }
+}
+```
+
+### 6.7 Các filter hay dùng trong application.yml
+
+```yaml
+routes:
+  - id: order-route
+    uri: lb://order-service
+    predicates:
+      - Path=/order/**
+    filters:
+      - StripPrefix=1               # bỏ prefix /order trước khi gửi vào service
+      - AddRequestHeader=X-Gateway, true  # thêm header vào request
+      - name: RequestRateLimiter
+        args:
+          redis-rate-limiter.replenishRate: 10   # 10 request/giây
+          redis-rate-limiter.burstCapacity: 20   # tối đa 20 request cùng lúc
+```
+
+### 6.8 Bảng Predicate hay dùng
+
+| Predicate | Ý nghĩa | Ví dụ |
+|-----------|---------|-------|
+| `Path` | Route theo path | `Path=/order/**` |
+| `Method` | Route theo HTTP method | `Method=GET,POST` |
+| `Header` | Route theo header | `Header=X-Version, v2` |
+| `Query` | Route theo query param | `Query=type, premium` |
+| `After` | Chỉ route sau thời điểm | `After=2025-01-01T00:00:00Z` |
+
+---
+
+## 7. Kiến trúc hoàn chỉnh
+
+```
+Client (mobile/web)
+        ↓
+  API Gateway :8080          ← một cửa ngõ, logging, rate limit, auth
+        ↓
+  Eureka Server :8761        ← biết ai đang ở đâu
+     ↙        ↘
+Inventory    Order Service
+Service      :8082
+:8083, :8084  ↓
+(load         @CircuitBreaker
+balanced)     → fallback khi Inventory chết
+```
+
+Mỗi tầng giải quyết đúng 1 vấn đề, phối hợp với nhau tạo thành hệ thống resilient.
